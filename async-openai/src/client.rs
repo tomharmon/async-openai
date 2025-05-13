@@ -23,7 +23,7 @@ use crate::{
 pub struct Client<C: Config> {
     http_client: reqwest::Client,
     config: C,
-    backoff: backoff::ExponentialBackoff,
+    backoff: Option<backoff::ExponentialBackoff>,
 }
 
 impl Client<OpenAIConfig> {
@@ -38,7 +38,7 @@ impl<C: Config> Client<C> {
     pub fn build(
         http_client: reqwest::Client,
         config: C,
-        backoff: backoff::ExponentialBackoff,
+        backoff: Option<backoff::ExponentialBackoff>,
     ) -> Self {
         Self {
             http_client,
@@ -52,7 +52,7 @@ impl<C: Config> Client<C> {
         Self {
             http_client: reqwest::Client::new(),
             config,
-            backoff: Default::default(),
+            backoff: Some(Default::default()),
         }
     }
 
@@ -66,7 +66,13 @@ impl<C: Config> Client<C> {
 
     /// Exponential backoff for retrying [rate limited](https://platform.openai.com/docs/guides/rate-limits) requests.
     pub fn with_backoff(mut self, backoff: backoff::ExponentialBackoff) -> Self {
-        self.backoff = backoff;
+        self.backoff = Some(backoff);
+        self
+    }
+
+    /// Disable exponential backoff for requests.
+    pub fn without_backoff(mut self) -> Self {
+        self.backoff = None;
         self
     }
 
@@ -321,58 +327,85 @@ impl<C: Config> Client<C> {
     {
         let client = self.http_client.clone();
 
-        backoff::future::retry(self.backoff.clone(), || async {
-            let request = request_maker().await.map_err(backoff::Error::Permanent)?;
-            let response = client
-                .execute(request)
-                .await
-                .map_err(OpenAIError::Reqwest)
-                .map_err(backoff::Error::Permanent)?;
+        if let Some(backoff) = &self.backoff {
+            // Use the retry logic with backoff
+            backoff::future::retry(backoff.clone(), || async {
+                let request = request_maker().await.map_err(backoff::Error::Permanent)?;
+                let response = client
+                    .execute(request)
+                    .await
+                    .map_err(OpenAIError::Reqwest)
+                    .map_err(backoff::Error::Permanent)?;
+
+                let status = response.status();
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(OpenAIError::Reqwest)
+                    .map_err(backoff::Error::Permanent)?;
+
+                if status.is_server_error() {
+                    // OpenAI does not guarantee server errors are returned as JSON so we cannot deserialize them.
+                    let message: String = String::from_utf8_lossy(&bytes).into_owned();
+                    tracing::warn!("Server error: {status} - {message}");
+                    return Err(backoff::Error::Transient {
+                        err: OpenAIError::ApiError(ApiError { message, r#type: None, param: None, code: None }),
+                        retry_after: None,
+                    });
+                }
+
+                // Deserialize response body from either error object or actual response object
+                if !status.is_success() {
+                    let wrapped_error: WrappedError = serde_json::from_slice(bytes.as_ref())
+                        .map_err(|e| map_deserialization_error(e, bytes.as_ref()))
+                        .map_err(backoff::Error::Permanent)?;
+
+                    if status.as_u16() == 429
+                        // API returns 429 also when:
+                        // "You exceeded your current quota, please check your plan and billing details."
+                        && wrapped_error.error.r#type != Some("insufficient_quota".to_string())
+                    {
+                        // Rate limited retry...
+                        tracing::warn!("Rate limited: {}", wrapped_error.error.message);
+                        return Err(backoff::Error::Transient {
+                            err: OpenAIError::ApiError(wrapped_error.error),
+                            retry_after: None,
+                        });
+                    } else {
+                        return Err(backoff::Error::Permanent(OpenAIError::ApiError(
+                            wrapped_error.error,
+                        )));
+                    }
+                }
+
+                Ok(bytes)
+            })
+            .await
+        } else {
+            // Execute the request without retry logic
+            let request = request_maker().await?;
+            let response = client.execute(request).await.map_err(OpenAIError::Reqwest)?;
 
             let status = response.status();
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(OpenAIError::Reqwest)
-                .map_err(backoff::Error::Permanent)?;
+            let bytes = response.bytes().await.map_err(OpenAIError::Reqwest)?;
 
             if status.is_server_error() {
                 // OpenAI does not guarantee server errors are returned as JSON so we cannot deserialize them.
                 let message: String = String::from_utf8_lossy(&bytes).into_owned();
                 tracing::warn!("Server error: {status} - {message}");
-                return Err(backoff::Error::Transient {
-                    err: OpenAIError::ApiError(ApiError { message, r#type: None, param: None, code: None }),
-                    retry_after: None,
-                });
+                return Err(OpenAIError::ApiError(ApiError { message, r#type: None, param: None, code: None }));
             }
 
             // Deserialize response body from either error object or actual response object
             if !status.is_success() {
                 let wrapped_error: WrappedError = serde_json::from_slice(bytes.as_ref())
-                    .map_err(|e| map_deserialization_error(e, bytes.as_ref()))
-                    .map_err(backoff::Error::Permanent)?;
+                    .map_err(|e| map_deserialization_error(e, bytes.as_ref()))?;
 
-                if status.as_u16() == 429
-                    // API returns 429 also when:
-                    // "You exceeded your current quota, please check your plan and billing details."
-                    && wrapped_error.error.r#type != Some("insufficient_quota".to_string())
-                {
-                    // Rate limited retry...
-                    tracing::warn!("Rate limited: {}", wrapped_error.error.message);
-                    return Err(backoff::Error::Transient {
-                        err: OpenAIError::ApiError(wrapped_error.error),
-                        retry_after: None,
-                    });
-                } else {
-                    return Err(backoff::Error::Permanent(OpenAIError::ApiError(
-                        wrapped_error.error,
-                    )));
-                }
+                return Err(OpenAIError::ApiError(wrapped_error.error));
             }
 
             Ok(bytes)
-        })
-        .await
+        }
     }
 
     /// Execute a HTTP request and retry on rate limit
