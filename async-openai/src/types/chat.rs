@@ -607,6 +607,8 @@ pub enum ServiceTier {
     Auto,
     Default,
     Flex,
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Clone, Serialize, Debug, Deserialize, PartialEq)]
@@ -615,6 +617,8 @@ pub enum ServiceTierResponse {
     Scale,
     Default,
     Flex,
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 #[derive(Clone, Serialize, Debug, Deserialize, PartialEq)]
